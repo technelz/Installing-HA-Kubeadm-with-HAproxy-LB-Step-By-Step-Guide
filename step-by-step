@@ -1,0 +1,352 @@
+#Author: Technelogics © 2024
+#Ref: https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/
+	
+DIFFERENT TYPES OF KUBEADM ARCHITECTURE
+Image in description.
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+### Let’s begin by installing Haproxy on a dedicated LB server, along with keepalived which  manages floating IP addresses which clients will use to access the kubernetes API server, and serves as an entry point for incoming traffic. keepslived shd be on all masters but haproxy on LB only and enable firewall on port 6443.
+
+apt update && apt install -y haproxy keepalived
+
+### Allow firewall on LB
+ufw allow 6443/tcp
+
+### Configure Haproxy
+Overwrite the lines below to **/etc/haproxy/haproxy.cfg**
+
+cat <<EOF> /etc/haproxy/haproxy.cfg
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+    chroot /var/lib/haproxy
+    stats socket /run/haproxy/admin.sock mode 660 level admin
+    stats timeout 30s
+    user haproxy
+    group haproxy
+    daemon
+
+defaults
+    log global
+    mode tcp
+    timeout connect 5000ms
+    timeout client 50000ms
+    timeout server 50000ms
+
+frontend kubernetes-frontend
+    bind *:6443
+    mode tcp
+    default_backend kubernetes-backend
+
+backend kubernetes-backend
+    mode tcp
+    balance roundrobin
+    server master1 10.0.0.M1-IP:6443 check fall 3 rise 2
+    server master2 10.0.0.M2-IP:6443 check fall 3 rise 2
+EOF
+
+### START AND ENABLE HAPROXY ON THE LB Server Only
+systemctl restart haproxy
+systemctl enable haproxy
+systemctl status haproxy
+
+### CHECK VALIDITY OF YOUR LB CONF FILE:
+haproxy -f haproxy.cfg -c
+
+### APPLY DEFAULT CONF, You can also choose to use a CUSTOM Conf, to do that create the file and direct haproxt to it by running, eg: haproxy -f (file-dir/filename.cfg), here we'd be using the default, but ensure you are in it's directory i.e --- cd /etc/haproxy/haproxy.cfg:
+haproxy -f haproxy.cfg
+
+### FOR REAL TIME LOG CHECK:
+journalctl -u haproxy -f
+
+N/B: When LB node is paused service will be disconnected
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+
+#Set Local DNS, replacing with your server's IP or FQDN to enable name resolution, I'll advice you do this manually anyway !!!
+cat << EOF >> /etc/hosts
+10.0.0.80 master0
+10.0.0.81 master1
+10.0.0.82 master2
+10.0.0.83 node1
+10.0.0.84 node2
+10.0.0.85 node3
+10.0.0.86 node4
+10.0.0.87 node5
+10.0.0.88 LB1
+10.0.0.89 LB2
+EOF
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+#Switch to root and update "APT repo"
+sudo -i
+
+apt update -y
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+#Add Port: 1 - 65535 on both Master & Worker Nodes (Allow All Traffic for Demo Purpose only,I'm using on-prem here but for cloud you have to allow SG to all ports)
+ufw allow 1:65535/tcp
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+#Set the hostname for each machine accordingly.
+hostnamectl set-hostname "master1"
+exec bash
+
+#On the worker nodes: Run accordingly on each server!
+hostnamectl set-hostname "node1"
+exec bash
+
+sudo hostnamectl set-hostname "node2"
+exec bash
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+# Load the br_netfilter module required for networking.
+sudo modprobe overlay
+sudo modprobe br_netfilter
+cat <<EOF | sudo tee /etc/modules-load.d/containerd.conf
+overlay
+br_netfilter
+EOF
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+
+# To allow iptables to see bridged traffic, as required by Kubernetes, we need to set the values of certain fields to 1. This updates sysctl settings to enhance networking.
+sudo tee /etc/sysctl.d/kubernetes.conf<<EOF
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-iptables = 1
+net.ipv4.ip_forward = 1
+EOF
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+# Apply the new settings without restarting.
+sudo sysctl --system
+
+# Install curl.
+sudo apt install curl -y
+
+# Install Dependencies
+sudo apt-get install -y apt-transport-https ca-certificates curl software-properties-common gnupg2 
+
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+### REMOVE CONFLICTING CRT IF ANY EXIST: ###
+for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do sudo apt-get remove $pkg; done
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+### INSTALL CONTAINERD AS DEFAULT CRI:
+
+sudo apt-get update
+#sudo apt-get purge docker-ce docker-ce-cli
+sudo mkdir -p /etc/containerd
+sudo apt install containerd
+containerd config default | sudo tee /etc/containerd/config.toml
+sudo systemctl enable --now containerd
+containerd --version
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+
+### LATEST REPO DIRECT FROM K8S.io 2024, N/B the google hosted repository is no longer compactible with the latest K8S (March 2024)
+
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /'| sudo tee /etc/apt/sources.list.d/kubernetes.list
+
+sudo apt update
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+
+### INSTALL KUBEADM, KUBELET & KUBECTL 1.29. This should pull down from the repo above !!! Mark the installed packages as held to prevent unintended upgrades
+#sudo apt-get update
+sudo apt-get install -y kubelet kubeadm kubectl
+sudo apt-mark hold kubelet kubeadm kubectl
+
+# N/B Worker nodes do not require kubeadm installed anyway!
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+
+# Finally, enable the kubelet service on all VMs so it persist upon restart.
+sudo systemctl enable --now kubelet
+
+CHECK THE VERSION OF EACH COMPONENT
+kubelet --version
+kubeadm version
+kubectl version --client
+
+# To allow kubelet to work properly, we need to disable swap on all VMs using: 
+Swap is a space on a disk that is used as virtual memory by the operating system when the physical memory (RAM) is full. Disabling swap using swapoff -a means that the system will no longer use swap space for virtual memory operations. In high availability setups where quick response times are crucial, disabling swap can help ensure that the system always operates within the available physical memory, avoiding delays caused by disk I/O
+
+sudo swapoff -a
+sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+
+ALL SET, Now let's proceed and Configure a cgroup driver, this is important for the management of cgroups on Linux machines
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+
+# Set up the default configuration file. This copies the containerd configuration from it's parent dir into /etc/containerd/config.toml  !!! 
+
+# You may choose to use 'sed' to configure containerd so that it starts using systemd as cgroup, or manually go to the file and scroll down and edit it to true.
+
+containerd config default | sudo tee /etc/containerd/config.toml >/dev/null 2>&1
+sudo sed -i 's/SystemdCgroup \= false/SystemdCgroup \= true/g' /etc/containerd/config.toml
+
+# Restart and enable containerd service
+sudo systemctl restart containerd
+sudo systemctl enable containerd
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+
+# List of processes where "containerd" appears in their command name, executable path, or other related information. 
+This is useful for identifying running processes related to the container runtime "containerd", which is commonly used in containerized environments like Docker and Kubernetes:
+ps -ef | grep containerd
+
+#Expect output similar to this:
+#root       63087       1  0 13:16 ?        00:00:00 /usr/bin/containerd
+
+# List all containers managed by containerd and filter out Kubernetes-related containers (excluding pause containers)
+crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock ps -a | grep kube | grep -v pause
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+### On MASTER node:
+### Now that our container runtime and Kubernetes modules are installed, let's proceed and initialize our Kubernetes cluster.
+
+#Run this cmd on master node to pull the default set of images specified in the kubeadm-config.yaml file from the K8S repository. Once the images are successfully pulled, they become available locally and therefore eliminates delays caused by image pull during cluster operations. You can now proceed and initialize or join a Kubernetes cluster using kubeadm.
+sudo kubeadm config images pull
+
+### Initialize the cluster for single k8s master cluster:
+#sudo kubeadm init --pod-network-cidr=10.244.0.0/16
+#sudo kubeadm init --pod-network-cidr=10.244.0.0/16 --ignore-preflight-errors=NumCPU --ignore-preflight-errors=Mem
+
+### Initialize for multi-master k8s cluster, you need to advertise the LB to the control-plane-endpoint, and the master advertised to API-Server
+kubeadm init --control-plane-endpoint "LOAD_BALANCER_DNS:LB_PORT"--upload-certs
+kubeadm init --control-plane-endpoint="10.0.0.71:6443" --upload-certs --apiserver-advertise-address=10.0.0.70 --pod-network-cidr=192.168.0.0/16
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+
+#The initialization may take a few moments to finish. Expect an output similar to the following:
+#Your Kubernetes control-plane has initialized successfully!
+
+#Now create a folder to house the Kubernetes configuration in the home directory. We also need to set up the required permissions for the directory, and export the KUBECONFIG variable. Required to be able to run k8s as Regular user !!!
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+#Alternatively, if you are the root user, run this to export the conf and be able to run kubectl commands as Root User !!!:
+# export KUBECONFIG=/etc/kubernetes/admin.conf
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+
+#You should now deploy a pod network to the cluster. Run kubectl apply -f [podnetwork].yaml with one of the options listed at Kubernetes.
+### Deploy a pod network to our cluster. This is required to interconnect the different Kubernetes components else the nodes will appear as 'not ready' !!!
+kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
+
+#Expect an output like this: Once this is done, the master node connectivity status becomes Ready!
+#clusterrole.rbac.authorization.k8s.io/calico-kube-controllers created
+#clusterrole.rbac.authorization.k8s.io/calico-node created
+#clusterrolebinding.rbac.authorization.k8s.io/calico-kube-controllers created
+#clusterrolebinding.rbac.authorization.k8s.io/calico-node created
+#daemonset.apps/calico-node created
+#deployment.apps/calico-kube-controllers created
+
+
+# Then you can join any number of worker nodes by running the following on each as root: N/B: FOR SINGLE MASTER CLUSTER Only!!!
+kubeadm join 10.0.0.71:6443 --token u3oj6n.k53g19oc6d150kfz \
+        --discovery-token-ca-cert-hash sha256:7353654820f52c15974f8606f464ceae6ad9bd638aa2ddb88b1191d9caf8bd21
+
+
+### To join master2, do advertise it's address along with the join command from earlier
+kubeadm join 10.0.0.71:6443 --token u3oj6n.k53g19oc6d150kfz \
+        --discovery-token-ca-cert-hash sha256:7353654820f52c15974f8606f464ceae6ad9bd638aa2ddb88b1191d9caf8bd21 \
+        --control-plane --certificate-key 46317d5baaf2c2b46847e8e77e7d165ff3d06e7933e5e8f59520683eec276599 --apiserver-advertise-address=10.master2-IP
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+### To verify that our master node(s)  are ready, run:
+kubectl get nodes
+
+### To check whether all the default pods are running with cmd below, you should get an output like this:
+kubectl get pods --all-namespaces
+
+NAMESPACE     NAME                                                  READY   STATUS    RESTARTS   AGE
+kube-system   calico-kube-controllers-658d97c59c-9l7gw   1/1     Running   0          7m59s
+kube-system   calico-node-krqw6                                              1/1     Running   0          7m59s
+kube-system   coredns-76f75df574-frbwv                               1/1     Running   0          56m
+kube-system   coredns-76f75df574-kx5zf                                1/1     Running   0          56m
+kube-system   etcd-master1                                                       1/1     Running   0          56m
+kube-system   kube-apiserver-master1                                    1/1     Running   0          56m
+kube-system   kube-controller-manager-master1                  1/1     Running   0          56m
+kube-system   kube-proxy-qxfcq                                                1/1     Running   0          56m
+kube-system   kube-scheduler-master1                                    1/1     Running   2          56m
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+### Now on WORKER node. Execute the kubeadm join 'worker cmd' from earlier. You should see an output similar to the following:
+# This node has joined the cluster:
+
+### Run kubectl get nodes on the control-plane again to see the worker-node you just joined to the cluster.
+kubectl get nodes
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+
+### Finally, assign labels to nodes to set proper role for each worker node. This allows proper organization and management of your Kubernetes cluster, run this command on the master node and remember to modify accordingly for each worker !!!
+
+kubectl label node worker-node node-role.kubernetes.io/worker=worker
+
+# To verify that the role was set, run "kubectl get nodes" again. Now each node should be labeled.
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
+
+OTHERS 
+#To regenerate join command if lost or expired:
+kubeadm token create --print-join-command
+
+Securely copy 'admin.conf' from master/remote to worker-local, you'll be prompted to enter the password for the root user on the remote server 
+Once authenticated, the admin.conf file will be securely copied from the remote server to your local machine and saved as ~/.kube/config, allowing you to interact with the Kubernetes cluster using kubectl commands.
+If you're using SSH keys for authentication, ensure that the SSH private key is accessible and properly configured on your local machine. Additionally, ensure that the SSH public key is properly configured in the authorized_keys file on the remote server. 
+	• SSH Config File (/etc/ssh/sshd_config):
+Configure SSH server settings in this file. back it up b4 editing; 
+cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bk
+Ensure PermitRootLogin is set to yes if you're using the root user for scp. And in this case, the root-user pasword has to be set. Then run "sudo systemctl restart sshd"
+
+	• Make sure the public keys of authorized users are added to the ~/.ssh/authorized_keys file for passwordless authentication.
+Ensure proper permissions are set on the ~/.ssh directory (700) and the authorized_keys file (600).
+
+mkdir ~/.kube
+scp root@10.0.M1.IP:/etc/kubernetes/admin.conf ~/.kube/config
+
+
+Setting up Kubernetes cluster access for administrative users by configuring and securing the necessary configuration files.
+sudo chmod +r /etc/kubernetes/admin.conf
+mkdir ~/.kube
+mv admin.conf ~/.kube/config
+chmod 600 ~/.kube/config
+sudo chmod 600 /etc/kubernetes/admin.conf
+
+
+You can then choose the desired alternative from the list. This is useful when you have multiple versions or implementations of iptables installed on your system and you want to select a specific one to be the default.
+sudo update-alternatives --config iptables
+
+# To watch as CNI initializes conx
+watch kubectl get nodes
+
+### To quickly get an overview of the Kubernetes cluster and its components, which can be useful for troubleshooting, monitoring, and general administration tasks.
+kubectl cluster-info 
+kubectl cluster-info dump
+
+### Used to see which tokens are currently active and their expiration times. This information is useful for managing access to the Kubernetes cluster and ensuring that authentication tokens are renewed or replaced as needed
+kubeadm token list
+
+### Watch the pods of the control plane components get started:
+kubectl get pod -n kube-system -w
+
+# To list all containers managed by containerd and filter out Kubernetes-related containers (excluding pause containers)
+crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock ps -a | grep kube | grep -v pause
+
+# To list available versions of the kubeadm package in reverse chronological order. 
+apt-cache madison kubeadm | tac
+
+# To add k8s to Jenkins CICD
+sudo kubeadm join <master-node-ip>:<master-node-port> --token <token> --discovery-token-ca-cert-hash <hash>
+
+Copy the config file to Jenkins master or the local file manager and save as k8s-secret-file.txt. This is the secret-file, save the config in here this will be used in the Kuberenetes credential section.
+
+# Required Ports
+ufw allow 6443 && ufw allow 2379:2380/tcp && ufw allow 10250 && ufw allow 10251 && ufw allow 10252
+
+# Some of these ports are primarily used on master nodes (such as 6443, 2379:2380, and 10251), others are used on both master and worker nodes (such as 10250 and 10252). It’s important to configure your firewall rules to allow traffic on these ports based on your cluster’s architecture and communication requirements.
+
+Flush IP Tables: Used to remove all existing rules from the IP tables firewall configuration. 
+iptables -F &&iptables -t nat -F &&iptables -t mangle -F &&iptables -X
+
+ALIAS
+sudo tee ~/.bashrc <<EOF 
+alias c='cd'
+alias k='kubectl'
+alias l='ls -la'
+alias h='history'
+EOF
+
+Or alternatively, run for each shortcut eg.
+echo alias l='ls -la' >> ~/.bashrc
+
+
